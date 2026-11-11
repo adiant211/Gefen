@@ -3,6 +3,8 @@
 
 namespace py = pybind11;
 
+void gefen_set_variant_flags(int64_t flags, int64_t seed);
+
 void automatic_gefen_fused_update_cuda(
     at::Tensor p,
     at::Tensor grad_view,
@@ -105,6 +107,13 @@ void gefen_lloyd_mse_cuda(
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(
+        "gefen_set_variant_flags",
+        &gefen_set_variant_flags,
+        "Set accuracy-variant flags and the stochastic-rounding seed for the fused update kernels",
+        py::arg("flags"),
+        py::arg("seed")
+    );
     m.def(
         "automatic_gefen_fused_update_cuda",
         &automatic_gefen_fused_update_cuda,

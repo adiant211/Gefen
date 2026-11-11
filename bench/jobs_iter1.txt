@@ -1,0 +1,11 @@
+# Iteration 1: baselines + variant 2a (apply update from unquantized momentum). 50M tokens, seeds 0-2.
+# <GEFEN_FLAGS or -> | <train.py args>
+- | --opt adamw --variant base --seed 0 --probe_every 0
+- | --opt gefen --variant base --seed 0 --gefen_src /workspace/src_base
+unquant_update | --opt gefen --variant unquant --seed 0
+- | --opt adamw --variant base --seed 1 --probe_every 0
+- | --opt gefen --variant base --seed 1 --gefen_src /workspace/src_base
+unquant_update | --opt gefen --variant unquant --seed 1
+- | --opt adamw --variant base --seed 2 --probe_every 0
+- | --opt gefen --variant base --seed 2 --gefen_src /workspace/src_base
+unquant_update | --opt gefen --variant unquant --seed 2

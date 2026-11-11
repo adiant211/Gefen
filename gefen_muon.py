@@ -51,6 +51,19 @@ def _zeropower_via_newtonschulz(
     return ortho_grad
 
 
+def normuon_normalize(
+    ortho_update: torch.Tensor, row_v: torch.Tensor, beta2: float, eps: float = 1e-8
+) -> torch.Tensor:
+    """NorMuon (benchmark fork): per-output-row second moment of the orthogonalized update.
+
+    Updates row_v in place and returns the fp32 update divided by sqrt(row_v). The caller rescales it so the
+    update RMS is 0.2, which also makes bias correction unnecessary (it is a uniform factor).
+    """
+    update = ortho_update.float()
+    row_v.mul_(beta2).add_(update.square().mean(dim=1), alpha=1 - beta2)
+    return update.div_(row_v.sqrt().add_(eps).unsqueeze(1))
+
+
 def _adjust_lr(
     lr: float, adjust_lr_fn: Optional[str], param_shape: torch.Size
 ) -> float:
@@ -81,6 +94,8 @@ class GefenMuon(Gefen):
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
         *,
+        normuon: bool = False,
+        normuon_beta2: float = 0.95,
         fused: bool = True,
         verbose: bool = False,
     ) -> None:
@@ -118,6 +133,8 @@ class GefenMuon(Gefen):
             group["ns_coefficients"] = ns_coefficients
             group["ns_steps"] = ns_steps
             group["adjust_lr_fn"] = adjust_lr_fn
+            group["normuon"] = normuon
+            group["normuon_beta2"] = normuon_beta2
             for p in group["params"]:
                 if p.ndim != 2:
                     raise ValueError(
@@ -322,7 +339,22 @@ class GefenMuon(Gefen):
             group["eps"],
         )
 
-        adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
+        if group.get("normuon", False):
+            row_v = state.get("normuon_v")
+            if row_v is None:
+                row_v = torch.zeros(
+                    update.shape[0], dtype=torch.float32, device=update.device
+                )
+                state["normuon_v"] = row_v
+            update = normuon_normalize(update, row_v, group["normuon_beta2"])
+            # RMS 0.2 like AdamW; a tensor scale avoids a host sync per parameter
+            update.mul_(
+                (0.2 * math.sqrt(update.numel()))
+                / update.norm().clamp(min=1e-12)
+            )
+            adjusted_lr = lr
+        else:
+            adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], p.shape)
         if group["weight_decay"] > 0.0:
             local_p.mul_(1 - lr * group["weight_decay"])
 

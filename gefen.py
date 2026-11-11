@@ -1,4 +1,5 @@
 import math
+import os
 from itertools import chain
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
@@ -16,6 +17,47 @@ FUSE_AUTOMATIC_VMEAN_UPDATE = True
 FUSE_GEFEN_AUTOMATIC_STEP = True
 FUSE_HISTOGRAM_FOR_EXACT = True
 F_FP32 = False
+
+# Accuracy variants (benchmark fork). Selected with GEFEN_FLAGS="name,name"; empty = Gefen 1.2.3 behaviour.
+VARIANT_FLAG_BITS = {
+    "unquant_update": 1,  # apply the update from the unquantized new momentum
+    "sr": 2,  # unbiased stochastic rounding onto the codebook
+}
+
+
+# Python-side second-moment variants (step 3c). The gradient is divided by sqrt(profile) before it reaches the
+# unchanged kernels, so the effective second moment is vmean[block] * profile[position]:
+#   vprof_col  - one profile per tensor over the positions in a block (Adafactor-style rank-1 factor), period floats
+#   vprof_full - one profile entry per element (ceiling for the second-moment path; costs 4 bytes per parameter)
+V_PROFILE_VARIANTS = {"vprof_col": "col", "vprof_full": "full"}
+
+
+def _variant_names(raw: Optional[str]):
+    if raw is None:
+        raw = os.environ.get("GEFEN_FLAGS", "")
+    names = raw.replace(",", " ").split()
+    for name in names:
+        if name not in VARIANT_FLAG_BITS and name not in V_PROFILE_VARIANTS:
+            raise ValueError(
+                "Unknown GEFEN_FLAGS entry {!r}; known: {}".format(
+                    name, ", ".join(sorted(set(VARIANT_FLAG_BITS) | set(V_PROFILE_VARIANTS)))
+                )
+            )
+    return names
+
+
+def parse_variant_flags(raw: Optional[str] = None) -> int:
+    flags = 0
+    for name in _variant_names(raw):
+        flags |= VARIANT_FLAG_BITS.get(name, 0)
+    return flags
+
+
+def parse_v_profile_mode(raw: Optional[str] = None) -> Optional[str]:
+    modes = {V_PROFILE_VARIANTS[n] for n in _variant_names(raw) if n in V_PROFILE_VARIANTS}
+    if len(modes) > 1:
+        raise ValueError("Choose one of {}".format(", ".join(V_PROFILE_VARIANTS)))
+    return modes.pop() if modes else None
 
 
 def automatic_partition_view(flat_tensor: torch.Tensor, period: int) -> torch.Tensor:
@@ -520,6 +562,15 @@ class Gefen(torch.optim.Optimizer):
 
         self.fused = fused
         self.verbose = verbose
+        self._variant_flags = parse_variant_flags()
+        self._variant_flags_sent = False
+        if self._variant_flags:
+            print("Gefen accuracy variant flags: {}".format(self._variant_flags))
+            if not fused:
+                raise ValueError("GEFEN_FLAGS variants are implemented in the fused CUDA path only.")
+        self._v_profile_mode = parse_v_profile_mode()
+        if self._v_profile_mode:
+            print("Gefen second-moment profile: {}".format(self._v_profile_mode))
 
         self._printed_optimizer_memory = False
         self._gefen_codebook = None
@@ -1269,6 +1320,9 @@ class Gefen(torch.optim.Optimizer):
 
         automatic_period = state["automatic_period"]
         grad_view = self._automatic_view(flat_grad, automatic_period)
+        if self._v_profile_mode and automatic_period > 1 and grad_view.shape[0] > 1:
+            grad_view = self._apply_v_profile(state, grad_view, beta2)
+            flat_grad = grad_view.reshape(-1)
         use_fused_gefen_step = self._use_fused_gefen_automatic_step()
         use_period1_fused_step = use_fused_gefen_step and automatic_period == 1
 
@@ -1331,6 +1385,32 @@ class Gefen(torch.optim.Optimizer):
             )
             update.mul_(lr)
             local_p.add_(-update)
+
+    def _apply_v_profile(self, state, grad_view: torch.Tensor, beta2: float) -> torch.Tensor:
+        """Update the position profile and return the gradient divided by sqrt(normalized profile)."""
+        g32 = grad_view.float()
+        stat = g32.square()
+        if self._v_profile_mode == "col":
+            stat = stat.mean(dim=0, keepdim=True)
+        profile = state.get("v_profile")
+        if profile is None:
+            state["v_profile"] = stat.clone()
+        else:
+            profile.mul_(beta2).add_(stat, alpha=1 - beta2)
+        factor = self.v_profile_factor(state)
+        # out of place: for fp32 gradients .float() aliases p.grad
+        return (g32 / factor.sqrt()).to(grad_view.dtype)
+
+    def v_profile_factor(self, state) -> Optional[torch.Tensor]:
+        """Normalized profile (mean 1 over each block) that multiplies vmean, or None."""
+        profile = state.get("v_profile")
+        if profile is None:
+            return None
+        if self._v_profile_mode == "col":
+            scale = profile.mean()
+        else:
+            scale = profile.mean(dim=1, keepdim=True)
+        return (profile / scale.clamp_min(1e-30)).clamp_min(1e-8)
 
     def _optimizer_state_memory_bytes(self) -> int:
         total = 0
@@ -1396,6 +1476,22 @@ class Gefen(torch.optim.Optimizer):
                 )
                 live_state[key] = saved_value.to(device=device, dtype=saved_value.dtype)
 
+    def _send_variant_flags(self, param_index: int) -> None:
+        flags = self._variant_flags
+        if not flags:
+            return
+        stochastic = bool(flags & VARIANT_FLAG_BITS["sr"])
+        if self._variant_flags_sent and not stochastic:
+            return
+        from gefen.kernels.gefen_cuda import load_extension
+
+        # distinct, reproducible random stream per (optimizer step, tensor)
+        seed = (
+            self._gefen_global_step * 0x9E3779B1 + param_index * 0x85EBCA77 + 0x2545F491
+        ) & 0x7FFFFFFFFFFFFFFF
+        load_extension().gefen_set_variant_flags(flags, seed)
+        self._variant_flags_sent = True
+
     @torch.no_grad()
     def step(self, closure=None):
         self._maybe_refresh_gefen_codebook()
@@ -1406,12 +1502,15 @@ class Gefen(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        param_index = 0
         for group in self.param_groups:
             name = group["name"]
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
                     continue
+                self._send_variant_flags(param_index)
+                param_index += 1
                 self._step_automatic(group, name, p, grad)
 
         self._gefen_global_step += 1

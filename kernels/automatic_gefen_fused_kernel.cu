@@ -9,7 +9,33 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include <ATen/cuda/CUDAContext.h>
+
+// Accuracy-variant switches (benchmark fork). 0 reproduces Gefen 1.2.3 exactly.
+//   bit 0 (1): apply the update from the unquantized new momentum; only the stored state is quantized
+//   bit 1 (2): unbiased stochastic rounding onto the codebook instead of nearest rounding
+__constant__ int g_variant_flags = 0;
+__constant__ unsigned long long g_variant_seed = 0ULL;
+
+void gefen_set_variant_flags(int64_t flags, int64_t seed) {
+    const int f = static_cast<int>(flags);
+    const unsigned long long s = static_cast<unsigned long long>(seed);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaMemcpyToSymbolAsync(g_variant_flags, &f, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
+    C10_CUDA_CHECK(cudaMemcpyToSymbolAsync(g_variant_seed, &s, sizeof(unsigned long long), 0, cudaMemcpyHostToDevice, stream));
+    // the source values live on this host stack frame; make sure the copies finished
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 namespace {
+
+__device__ __forceinline__ float variant_uniform(int64_t idx) {
+    unsigned long long z = g_variant_seed ^ (static_cast<unsigned long long>(idx) * 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return static_cast<float>(z >> 40) * (1.0f / 16777216.0f);
+}
 
 __device__ __forceinline__ uint8_t unpack_codebook_index(
     const uint8_t* __restrict__ packed_indices,
@@ -89,6 +115,41 @@ __device__ __forceinline__ uint8_t nearest_codebook_index(
     return static_cast<uint8_t>(left_dist <= right_dist ? left_idx : right_idx);
 }
 
+// Nearest rounding (1.2.3 behaviour) or, with variant bit 1, unbiased stochastic rounding between the two
+// codebook entries that bracket the value: P(upper) = (x - lower) / (upper - lower), so E[result] = x.
+__device__ __forceinline__ uint8_t variant_codebook_index(
+    float normalized_value,
+    const float* __restrict__ codebook,
+    int codebook_size,
+    int64_t idx
+) {
+    if ((g_variant_flags & 2) == 0) {
+        return nearest_codebook_index(normalized_value, codebook, codebook_size);
+    }
+    int left = 0;
+    int right = codebook_size;
+    while (left < right) {
+        const int mid = left + (right - left) / 2;
+        if (codebook[mid] < normalized_value) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    const int hi_idx = left >= codebook_size ? codebook_size - 1 : left;
+    const int lo_idx = hi_idx > 0 ? hi_idx - 1 : 0;
+    const float lo = codebook[lo_idx];
+    const float hi = codebook[hi_idx];
+    if (normalized_value <= lo) {
+        return static_cast<uint8_t>(lo_idx);
+    }
+    if (normalized_value >= hi) {
+        return static_cast<uint8_t>(hi_idx);
+    }
+    const float p_hi = (normalized_value - lo) / (hi - lo);
+    return static_cast<uint8_t>(variant_uniform(idx) < p_hi ? hi_idx : lo_idx);
+}
+
 template <typename scalar_t, typename magnitude_t>
 __global__ void automatic_gefen_fused_update_kernel(
     scalar_t* __restrict__ p,
@@ -156,10 +217,12 @@ __global__ void automatic_gefen_fused_update_kernel(
         if (new_magnitude > 0.0f) {
             normalized_value = updated_value / new_magnitude;
         }
-        const uint8_t quantized_index = nearest_codebook_index(normalized_value, codebook, codebook_size);
+        const uint8_t quantized_index = variant_codebook_index(normalized_value, codebook, codebook_size, idx);
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
-            const float quantized_value = codebook[static_cast<int>(quantized_index)] * new_magnitude;
+            const float quantized_value = (g_variant_flags & 1)
+                ? updated_value
+                : codebook[static_cast<int>(quantized_index)] * new_magnitude;
             const float update_value = quantized_value * step * lr;
             p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
         }
@@ -307,10 +370,12 @@ __global__ void automatic_gefen_fused_update_from_vmean_kernel(
         if (new_magnitude > 0.0f) {
             normalized_value = updated_value / new_magnitude;
         }
-        const uint8_t quantized_index = nearest_codebook_index(normalized_value, codebook, codebook_size);
+        const uint8_t quantized_index = variant_codebook_index(normalized_value, codebook, codebook_size, idx);
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
-            const float quantized_value = codebook[static_cast<int>(quantized_index)] * new_magnitude;
+            const float quantized_value = (g_variant_flags & 1)
+                ? updated_value
+                : codebook[static_cast<int>(quantized_index)] * new_magnitude;
             const float update_value = quantized_value * step * lr;
             p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
         }
@@ -394,12 +459,14 @@ __global__ void automatic_gefen_period1_update_kernel(
             if (new_magnitude > 0.0f) {
                 normalized_value = updated_m / new_magnitude;
             }
-            const uint8_t quantized_index = nearest_codebook_index(normalized_value, codebook, codebook_size);
+            const uint8_t quantized_index = variant_codebook_index(normalized_value, codebook, codebook_size, idx);
             m_sign[idx] = quantized_index;
 
             const float corrected_vmean = static_cast<float>(vmean[idx]) / bias_correction_2;
             const float step = (1.0f / bias_correction_1) / (sqrtf(corrected_vmean) + eps);
-            const float quantized_value = codebook[static_cast<int>(quantized_index)] * new_magnitude;
+            const float quantized_value = (g_variant_flags & 1)
+                ? updated_m
+                : codebook[static_cast<int>(quantized_index)] * new_magnitude;
             const float update_value = quantized_value * step * lr;
             p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
         }

@@ -1,0 +1,16 @@
+# Iteration 3: GefenMuon and NorMuon vs fp32-momentum references. Hidden 2D matrices use (Gefen)Muon,
+# embedding and norms use fused AdamW in every run. 20M tokens (305 steps) to fit the 1-hour budget, seeds 0-2.
+# lr 6e-4 with RMS-matched updates (0.2), momentum 0.95 Nesterov, NorMuon beta2 0.95.
+# <GEFEN_FLAGS or -> | <train.py args>
+- | --opt muon --variant base --seed 0 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant base --seed 0 --tokens 20e6 --out /workspace/runs3
+- | --opt muon --variant normuon --normuon 1 --seed 0 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant normuon --normuon 1 --seed 0 --tokens 20e6 --out /workspace/runs3
+- | --opt muon --variant base --seed 1 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant base --seed 1 --tokens 20e6 --out /workspace/runs3
+- | --opt muon --variant normuon --normuon 1 --seed 1 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant normuon --normuon 1 --seed 1 --tokens 20e6 --out /workspace/runs3
+- | --opt muon --variant base --seed 2 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant base --seed 2 --tokens 20e6 --out /workspace/runs3
+- | --opt muon --variant normuon --normuon 1 --seed 2 --tokens 20e6 --probe_every 0 --out /workspace/runs3
+- | --opt gefenmuon --variant normuon --normuon 1 --seed 2 --tokens 20e6 --out /workspace/runs3

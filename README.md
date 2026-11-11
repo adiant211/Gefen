@@ -1,5 +1,13 @@
 # [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
 
+> **About this fork.** This is a fork of [Gefen](https://github.com/ndvbd/Gefen) by Nadav Benedek, based on
+> Gefen 1.2.3. It adds opt-in accuracy experiments: a column-profile second moment for Gefen (`GEFEN_FLAGS=vprof_col`),
+> a NorMuon option for GefenMuon (`GefenMuon(..., normuon=True)`), and a Qwen3-100M benchmark with graphs.
+> With no flags set, Gefen behaves exactly like 1.2.3. See **[EXPERIMENTS.md](EXPERIMENTS.md)** for the results
+> and the [`gefen-accuracy` branch diff](https://github.com/ndvbd/Gefen/compare/main...adiant211:Gefen:gefen-accuracy) for the code.
+>
+> ![Gap to AdamW](figures/accuracy/adam_gap_to_adamw.png)
+
 Gefen is a drop-in replacement for the AdamW optimizer (and Muon, see below) for memory-efficient
 pre-training. It keeps the familiar AdamW training recipe while dramatically
 reducing optimizer-state memory: an 8x reduction in AdamW memory footprint, or

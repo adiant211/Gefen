@@ -1,0 +1,10 @@
+# Iteration 2: second-moment path (3c). Baselines reuse iteration-1 runs. 50M tokens, seeds 0-2.
+# vprof_col: Adafactor-style column profile x Gefen per-block vmean (period floats per tensor).
+# vprof_full: per-element profile, a ceiling for the second-moment path (+4 bytes/param, fails the memory rule by design).
+# <GEFEN_FLAGS or -> | <train.py args>
+vprof_col | --opt gefen --variant vprof_col --seed 0
+vprof_full | --opt gefen --variant vprof_full --seed 0
+vprof_col | --opt gefen --variant vprof_col --seed 1
+vprof_full | --opt gefen --variant vprof_full --seed 1
+vprof_col | --opt gefen --variant vprof_col --seed 2
+vprof_full | --opt gefen --variant vprof_full --seed 2
